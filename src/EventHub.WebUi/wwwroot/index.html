@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EventHub Smoke UI</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #f4f1ea;
+            --panel: #fffaf0;
+            --accent: #9d5c0d;
+            --muted: #6b7280;
+            --border: #e5dccf;
+            --available: #d1fae5;
+            --reserved: #fee2e2;
+            --confirmed: #dbeafe;
+        }
+        body { margin: 0; font-family: Georgia, serif; background: var(--bg); color: #1f2933; }
+        main { max-width: 920px; margin: 0 auto; padding: 32px 20px 48px; }
+        .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 20px; margin-bottom: 18px; }
+        h1, h2 { margin-top: 0; }
+        input, button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); }
+        button { background: var(--accent); color: white; border: none; cursor: pointer; margin-right: 6px; }
+        button.secondary { background: #44515f; }
+        .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+        .status { font-size: 0.95rem; color: var(--muted); }
+        ul.events { list-style: none; padding: 0; }
+        ul.events li { padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 6px; cursor: pointer; }
+        ul.events li.selected { background: var(--confirmed); }
+        ul.seats { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 10px; }
+        ul.seats li { padding: 14px; text-align: center; border-radius: 10px; border: 1px solid var(--border); background: var(--available); cursor: pointer; }
+        ul.seats li.reserved { background: var(--reserved); cursor: not-allowed; }
+        ul.seats li.selected { outline: 3px solid var(--accent); }
+        pre { background: #1f2933; color: #f8fafc; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 0.85rem; }
+        .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; background: var(--confirmed); font-size: 0.8rem; }
+    </style>
+</head>
+<body>
+<main>
+    <h1>EventHub Smoke UI</h1>
+    <p class="status">Static-file SPA used by the Selenium end-to-end test. All API calls go through the gateway, and this page also acts as the external-login callback consumer.</p>
+
+    <section class="panel" id="auth-panel">
+        <h2>1. Sign in</h2>
+        <div class="row">
+            <input id="email-input" type="email" placeholder="Email" autocomplete="off">
+            <input id="password-input" type="password" placeholder="Password" autocomplete="off">
+        </div>
+        <div class="row">
+            <button id="register-button">Register</button>
+            <button id="login-button" class="secondary">Login</button>
+        </div>
+        <div id="auth-status" class="status" data-testid="auth-status">Not signed in.</div>
+    </section>
+
+    <section class="panel" id="events-panel" hidden>
+        <h2>2. Pick an event</h2>
+        <ul id="events-list" class="events" data-testid="events-list"></ul>
+    </section>
+
+    <section class="panel" id="seats-panel" hidden>
+        <h2>3. Pick a seat</h2>
+        <ul id="seats-list" class="seats" data-testid="seats-list"></ul>
+        <div class="row" style="margin-top: 12px;">
+            <button id="reserve-button" disabled>Reserve seat</button>
+        </div>
+        <div id="reserve-status" class="status" data-testid="reserve-status"></div>
+    </section>
+
+    <section class="panel" id="booking-panel" hidden>
+        <h2>4. Booking status</h2>
+        <div id="booking-status" class="status" data-testid="booking-status">Awaiting saga.</div>
+        <div style="margin-top: 8px;">
+            <span class="badge" id="signalr-status" data-testid="signalr-status">SignalR: disconnected</span>
+        </div>
+        <pre id="signalr-log" data-testid="signalr-log"></pre>
+    </section>
+</main>
+
+<!-- Optional runtime config. The k8s manifest mounts a ConfigMap here that sets
+    window.EVENTHUB_GATEWAY_BASE = '' so the SPA uses relative URLs (same-origin Ingress).
+    The docker-compose stack mounts a compose-specific config.js that points at the host gateway
+    port for that profile. When the file is absent (for example, a bare local dotnet run), the
+    inline default below applies. -->
+<script src="config.js" onerror="void 0"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.7/signalr.min.js"
+        integrity="sha512-qxTXS2R4P7QQvEZQ9YwxM0M0JmQ7P8OAK0V2Tszvx41IwlbG1udM4xA9M0frzlr0D6N7jM3jlhxA9l3YwM6SxA=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>
+    const gatewayBase = (typeof window.EVENTHUB_GATEWAY_BASE === 'string'
+        ? window.EVENTHUB_GATEWAY_BASE
+        : 'http://localhost:8080').replace(/\/$/, '');
+    const state = {
+        accessToken: null,
+        selectedEventId: null,
+        selectedSeat: null,
+        bookingId: null,
+        signalRConnection: null,
+        seatReservedSeen: false
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (id, text) => { $(id).textContent = text; };
+    const setAuthStatus = (text) => setStatus('auth-status', text);
+    const setReserveStatus = (text) => setStatus('reserve-status', text);
+    const setBookingStatus = (text) => setStatus('booking-status', text);
+    const setSignalRBadge = (text) => setStatus('signalr-status', `SignalR: ${text}`);
+    const appendLog = (text) => { const el = $('signalr-log'); el.textContent += `${text}\n`; };
+
+    async function api(path, options = {}) {
+        const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
+        if (state.accessToken && !headers['Authorization']) {
+            headers['Authorization'] = `Bearer ${state.accessToken}`;
+        }
+        const response = await fetch(`${gatewayBase}${path}`, Object.assign({}, options, { headers }));
+        const text = await response.text();
+        let body;
+        try { body = text ? JSON.parse(text) : null; } catch (_) { body = text; }
+        if (!response.ok) {
+            const error = new Error(`Request failed: ${response.status} ${response.statusText}`);
+            error.body = body;
+            error.status = response.status;
+            throw error;
+        }
+        return body;
+    }
+
+    function readExternalAuthCodeFromFragment() {
+        const hash = window.location.hash.startsWith('#')
+            ? window.location.hash.slice(1)
+            : window.location.hash;
+        if (!hash) {
+            return null;
+        }
+
+        const parameters = new URLSearchParams(hash);
+        return parameters.get('externalAuthCode');
+    }
+
+    function clearExternalAuthCodeFromFragment() {
+        const hash = window.location.hash.startsWith('#')
+            ? window.location.hash.slice(1)
+            : window.location.hash;
+        if (!hash) {
+            return;
+        }
+
+        const parameters = new URLSearchParams(hash);
+        parameters.delete('externalAuthCode');
+
+        const nextHash = parameters.toString();
+        const nextUrl = `${window.location.pathname}${window.location.search}${nextHash ? `#${nextHash}` : ''}`;
+        window.history.replaceState(null, '', nextUrl);
+    }
+
+    async function completeExternalLoginIfPresent() {
+        const handoffCode = readExternalAuthCodeFromFragment();
+        if (!handoffCode) {
+            return;
+        }
+
+        setAuthStatus('Completing external sign-in…');
+
+        try {
+            const response = await api('/api/identity/auth/external/exchange', {
+                method: 'POST',
+                body: JSON.stringify({ code: handoffCode })
+            });
+
+            clearExternalAuthCodeFromFragment();
+            applyAuthResponse(response, 'External login complete.');
+        } catch (error) {
+            clearExternalAuthCodeFromFragment();
+            const details = typeof error.body === 'object' && error.body?.error
+                ? ` ${error.body.error}`
+                : '';
+            setAuthStatus(`External login failed: ${error.message}${details}`);
+        }
+    }
+
+    async function onRegister() {
+        const email = $('email-input').value.trim();
+        const password = $('password-input').value;
+        setAuthStatus('Registering…');
+        try {
+            const response = await api('/api/identity/auth/register', {
+                method: 'POST',
+                body: JSON.stringify({ email, password, role: 'Customer' })
+            });
+            applyAuthResponse(response, `Registered as ${email}.`);
+        } catch (error) {
+            setAuthStatus(`Register failed: ${error.message}`);
+        }
+    }
+
+    async function onLogin() {
+        const email = $('email-input').value.trim();
+        const password = $('password-input').value;
+        setAuthStatus('Logging in…');
+        try {
+            const response = await api('/api/identity/auth/login', {
+                method: 'POST',
+                body: JSON.stringify({ email, password })
+            });
+            applyAuthResponse(response, `Logged in as ${email}.`);
+        } catch (error) {
+            setAuthStatus(`Login failed: ${error.message}`);
+        }
+    }
+
+    function applyAuthResponse(response, message) {
+        state.accessToken = response.accessToken;
+        const customerId = decodeJwtSub(response.accessToken);
+        setAuthStatus(customerId ? `${message} customerId=${customerId}` : message);
+        $('events-panel').hidden = false;
+        loadEvents();
+    }
+
+    function decodeJwtSub(token) {
+        try {
+            const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+            return payload.sub ?? payload.nameid ?? null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    async function loadEvents() {
+        try {
+            const response = await api('/api/catalog/events?pageSize=10');
+            const items = response?.items || [];
+            const list = $('events-list');
+            list.innerHTML = '';
+            for (const item of items) {
+                const li = document.createElement('li');
+                li.dataset.eventId = item.eventId;
+                li.dataset.testid = 'event-item';
+                li.textContent = `${item.organizer} — ${new Date(item.startsAtUtc).toLocaleString()} (seats: ${item.seatCount})`;
+                li.addEventListener('click', () => selectEvent(item));
+                list.appendChild(li);
+            }
+            if (items.length === 0) {
+                list.textContent = 'No events.';
+            }
+        } catch (error) {
+            $('events-list').textContent = `Failed to load events: ${error.message}`;
+        }
+    }
+
+    async function selectEvent(eventItem) {
+        state.selectedEventId = eventItem.eventId;
+        for (const li of $('events-list').querySelectorAll('li')) {
+            li.classList.toggle('selected', li.dataset.eventId === eventItem.eventId);
+        }
+        $('seats-panel').hidden = false;
+
+        try {
+            const seats = await api(`/api/catalog/events/${eventItem.eventId}/seats`);
+            renderSeats(seats);
+            await connectSignalR(eventItem.eventId);
+        } catch (error) {
+            $('seats-list').textContent = `Failed to load seats: ${error.message}`;
+        }
+    }
+
+    function renderSeats(seatPayload) {
+        const list = $('seats-list');
+        list.innerHTML = '';
+        const reserved = new Set(seatPayload.reservedSeats || []);
+        for (const seat of seatPayload.seats || []) {
+            const li = document.createElement('li');
+            li.textContent = seat;
+            li.dataset.seat = seat;
+            li.dataset.testid = `seat-${seat}`;
+            if (reserved.has(seat)) {
+                li.classList.add('reserved');
+            } else {
+                li.addEventListener('click', () => selectSeat(seat, li));
+            }
+            list.appendChild(li);
+        }
+    }
+
+    function selectSeat(seat, element) {
+        state.selectedSeat = seat;
+        for (const li of $('seats-list').querySelectorAll('li')) {
+            li.classList.remove('selected');
+        }
+        element.classList.add('selected');
+        $('reserve-button').disabled = false;
+    }
+
+    async function onReserve() {
+        if (!state.selectedEventId || !state.selectedSeat) return;
+        $('reserve-button').disabled = true;
+        setReserveStatus('Reserving…');
+        try {
+            const response = await api('/api/booking/reserve', {
+                method: 'POST',
+                body: JSON.stringify({
+                    eventId: state.selectedEventId,
+                    seatNumber: state.selectedSeat
+                })
+            });
+            state.bookingId = response.bookingId;
+            setReserveStatus(`Reserved bookingId=${state.bookingId}`);
+            $('booking-panel').hidden = false;
+            pollBookingUntilConfirmed();
+        } catch (error) {
+            setReserveStatus(`Reserve failed: ${error.message} ${JSON.stringify(error.body || {})}`);
+            $('reserve-button').disabled = false;
+        }
+    }
+
+    async function pollBookingUntilConfirmed() {
+        const deadline = Date.now() + 60_000;
+        while (Date.now() < deadline) {
+            try {
+                const response = await api('/api/booking');
+                const booking = (response?.items || []).find(item => item.bookingId === state.bookingId);
+                if (booking) {
+                    setBookingStatus(`Status: ${booking.status}`);
+                    if (booking.status.toLowerCase() === 'confirmed') {
+                        $('booking-status').dataset.confirmed = 'true';
+                        return;
+                    }
+                }
+            } catch (error) {
+                setBookingStatus(`Poll error: ${error.message}`);
+            }
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        setBookingStatus('Polling timed out.');
+    }
+
+    async function connectSignalR(eventId) {
+        if (state.signalRConnection) {
+            try { await state.signalRConnection.stop(); } catch (_) { /* ignore */ }
+        }
+
+        state.signalRConnection = new signalR.HubConnectionBuilder()
+            .withUrl(`${gatewayBase}/hubs/seats`)
+            .withAutomaticReconnect()
+            .build();
+
+        state.signalRConnection.on('SeatReserved', (broadcastEventId, seat) => {
+            appendLog(`SeatReserved event=${broadcastEventId} seat=${seat}`);
+            if (broadcastEventId.toLowerCase() === eventId.toLowerCase()) {
+                state.seatReservedSeen = true;
+                const badge = $('signalr-status');
+                badge.dataset.seatReserved = 'true';
+            }
+        });
+        state.signalRConnection.on('SeatReleased', (broadcastEventId, seat) => {
+            appendLog(`SeatReleased event=${broadcastEventId} seat=${seat}`);
+        });
+
+        try {
+            await state.signalRConnection.start();
+            setSignalRBadge('connected');
+            await state.signalRConnection.invoke('JoinEvent', eventId);
+        } catch (error) {
+            setSignalRBadge(`error (${error.message})`);
+        }
+    }
+
+    $('register-button').addEventListener('click', onRegister);
+    $('login-button').addEventListener('click', onLogin);
+    $('reserve-button').addEventListener('click', onReserve);
+
+    void completeExternalLoginIfPresent();
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/EventHub.WebUi/EventHub.WebUi.csproj" />
+  </Folder>
+</Solution>
